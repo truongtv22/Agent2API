@@ -4,6 +4,8 @@
 //! 记录的优先级、并发与冷却逻辑。`source` 只记来源，provider runtime id 才是归属。
 //! 旧插件继续使用 `plugin_upsert_account`，本体使用带来源的同一落库内核。
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use serde_json::{Map, Value};
 
 use crate::server::core::account_store::state::StoredAccount;
@@ -105,7 +107,69 @@ fn secret_of(record: &StoredAccount) -> Value {
             if let Some(fields) = secret.as_object_mut() { fields.insert(key.to_string(), Value::String(plan.to_string())); }
         }
     }
+    alias_autoclaw_access_token(&record.provider(), &mut secret);
     secret
+}
+
+/// AutoClaw 插件把 access token 落在 `token`。读给插件之前补上 `accessToken`，
+/// 不改库里的原文。别家的 `token` 含义不同，不能碰。
+fn alias_autoclaw_access_token(provider: &str, secret: &mut Value) {
+    if !super::is_autoclaw_family(provider) {
+        return;
+    }
+    let Some(fields) = secret.as_object_mut() else { return };
+    if field_text(fields, "accessToken").is_some() {
+        return;
+    }
+    let Some(token) = field_text(fields, "token") else { return };
+    fields.insert("accessToken".to_string(), Value::String(token));
+}
+
+/// 插件刷新后往往只改 `accessToken`。写回前把它同步到 `token`，并用新 token
+/// 的 `exp` 更新到期时间（毫秒，与存量记录一致）。
+fn sync_autoclaw_written_secret(provider: &str, secret: &mut Value) {
+    if !super::is_autoclaw_family(provider) {
+        return;
+    }
+    let Some(fields) = secret.as_object_mut() else { return };
+    let Some(access) = field_text(fields, "accessToken") else { return };
+    let access = raw_token(&access).to_string();
+    if access.is_empty() {
+        return;
+    }
+    fields.insert("accessToken".to_string(), Value::String(access.clone()));
+    fields.insert("token".to_string(), Value::String(access.clone()));
+    if let Some(exp_ms) = jwt_exp_ms(&access) {
+        fields.insert("expiresAt".to_string(), Value::from(exp_ms));
+        fields.insert("tokenExpiresAt".to_string(), Value::from(exp_ms));
+    }
+}
+
+fn field_text(fields: &Map<String, Value>, key: &str) -> Option<String> {
+    fields
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+fn raw_token(value: &str) -> &str {
+    let text = value.trim();
+    text.strip_prefix("Bearer ")
+        .or_else(|| text.strip_prefix("bearer "))
+        .unwrap_or(text)
+        .trim()
+}
+
+fn jwt_exp_ms(token: &str) -> Option<i64> {
+    let segment = raw_token(token).split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(segment.trim_end_matches('=').as_bytes())
+        .ok()?;
+    let payload: Value = serde_json::from_slice(&bytes).ok()?;
+    let exp = payload.get("exp")?.as_f64()?;
+    (exp > 0.0).then_some((exp * 1000.0) as i64)
 }
 
 /// 进程级账号存储句柄（bootstrap 时 install 一次）。
@@ -299,7 +363,9 @@ impl AccountStore {
             if &current != expect {
                 return Ok(Ok(false));
             }
-            record.set(SECRET_KEY, secret.clone());
+            let mut secret = secret.clone();
+            sync_autoclaw_written_secret(&record.provider(), &mut secret);
+            record.set(SECRET_KEY, secret);
             if let Some(public) = public.filter(|value| value.is_object()) {
                 record.set(PUBLIC_KEY, public.clone());
                 if record.get("pluginIdentityContract").and_then(Value::as_u64) == Some(1)
@@ -588,5 +654,45 @@ impl AccountStore {
             }
         }
         Value::Object(public)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_jwt(exp: i64) -> String {
+        let payload = URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp}}}"#));
+        format!("h.{payload}.s")
+    }
+
+    #[test]
+    fn alias_fills_access_token_from_token_for_autoclaw() {
+        let mut secret = json!({"token": "abc", "refreshToken": "r"});
+        alias_autoclaw_access_token("autoclaw-intl", &mut secret);
+        assert_eq!(secret["accessToken"], "abc");
+        assert_eq!(secret["token"], "abc");
+    }
+
+    #[test]
+    fn alias_leaves_other_providers_and_existing_access_token() {
+        let mut other = json!({"token": "abc"});
+        alias_autoclaw_access_token("zcode", &mut other);
+        assert!(other.get("accessToken").is_none());
+        let mut kept = json!({"token": "old", "accessToken": "keep"});
+        alias_autoclaw_access_token("autoclaw", &mut kept);
+        assert_eq!(kept["accessToken"], "keep");
+    }
+
+    #[test]
+    fn write_sync_copies_access_token_and_expiry() {
+        let jwt = sample_jwt(1_794_970_421);
+        let mut secret = json!({"token": "old", "accessToken": jwt, "refreshToken": "r"});
+        sync_autoclaw_written_secret("autoclaw-intl", &mut secret);
+        assert_eq!(secret["token"], secret["accessToken"]);
+        assert_eq!(secret["expiresAt"], 1_794_970_421_000_i64);
+        assert_eq!(secret["tokenExpiresAt"], 1_794_970_421_000_i64);
+        assert_eq!(secret["refreshToken"], "r");
     }
 }

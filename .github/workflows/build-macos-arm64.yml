@@ -1,0 +1,43 @@
+name: build-macos-arm64
+
+# 只编 macOS arm64 安装包。不派发到构建仓库，也不编其它平台。
+# 手动触发，避免每次推分支都占用 macOS runner。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  macos-arm64:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 安装 Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop-tauri/package-lock.json
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: 缓存 Rust 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-tauri/src-tauri -> ../../target
+
+      - name: 安装桌面端依赖
+        run: npm --prefix desktop-tauri ci
+
+      - name: 构建 macOS arm64 安装包
+        run: npm --prefix desktop-tauri run build -- --target aarch64-apple-darwin
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-arm64
+          path: target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
