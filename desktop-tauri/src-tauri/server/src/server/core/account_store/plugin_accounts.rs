@@ -365,7 +365,7 @@ impl AccountStore {
             }
             let mut secret = secret.clone();
             sync_autoclaw_written_secret(&record.provider(), &mut secret);
-            record.set(SECRET_KEY, secret);
+            record.set(SECRET_KEY, secret.clone());
             if let Some(public) = public.filter(|value| value.is_object()) {
                 record.set(PUBLIC_KEY, public.clone());
                 if record.get("pluginIdentityContract").and_then(Value::as_u64) == Some(1)
